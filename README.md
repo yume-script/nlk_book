@@ -58,9 +58,38 @@ https://raw.githubusercontent.com/leeyj/BookOasis_stable/refs/heads/main/plugins
 다른 저장소를 사용한다면 `nlk_book.py`의 `update_manifest["raw_base_url"]` 값을 실제 경로로 수정하세요.
 버전을 올릴 때는 `VERSION` 파일의 `"plugin version"` 값도 함께 증가시켜야 합니다.
 
-## 6. 참고
+## 6. 필드 매핑 (공식 가이드 기준)
+
+| Seoji 응답 필드 | 의미 | 매핑 대상 |
+|---|---|---|
+| TITLE | 표제 | title |
+| AUTHOR | 저자 | author |
+| PUBLISHER | 발행처 | publisher |
+| EA_ISBN / SET_ISBN | ISBN | isbn |
+| PUBLISH_PREDATE | 출판예정일(yyyymmdd) | pub_date (yyyy-mm-dd로 변환) |
+| TITLE_URL | 표지이미지 URL | cover_url |
+| SUBJECT / KDC / EDITION_STMT / PAGE / BOOK_SIZE / FORM / PRE_PRICE | 부가 서지정보 | summary에 조합 |
+
+`books` 테이블에 `pub_date`, `cover_url` 컬럼이 없다면 `apply()`에서 해당 필드 반영이
+무시되거나 오류가 날 수 있으니, 스키마에 맞게 `nlk_book.py`의 `apply()` 매핑을 조정하세요.
+
+## 7. 에러 코드
+
+국립중앙도서관 공식 가이드에 명시된 에러 코드를 한글 메시지로 변환해 반환합니다.
+
+| 코드 | 의미 |
+|---|---|
+| 000 | 시스템 오류 |
+| 010 | 인증키값 누락 |
+| 011 | 유효하지 않은 인증키 |
+| 012 | 필수 파라미터 입력 누락 |
+
+※ 실제 에러 응답의 JSON 키 이름이 공식 문서에 명시되어 있지 않아,
+`ERROR_CODE`/`ERR_CODE`/`errorCode`/`error_code`/`RESULT_CODE` 등 후보 키를 방어적으로
+확인합니다. 실제 서버 응답을 확인한 뒤 `_extract_error_code()`를 정확한 키로 조정하는 것을 권장합니다.
+
+## 8. 참고
 
 - Seoji API 문서: https://www.nl.go.kr/seoji/ (Open API 활용방법 페이지)
 - 응답 필드는 국립중앙도서관 정책에 따라 예고 없이 바뀔 수 있습니다.
-  주요 필드(`TITLE`, `AUTHOR`, `PUBLISHER`, `EA_ISBN`, `REAL_PUBLISH_DATE` 등)가
-  변경되면 `_doc_to_item()` 매핑 부분만 수정하면 됩니다.
+  변경 시 `_doc_to_item()` 매핑 부분만 수정하면 됩니다.

@@ -79,6 +79,14 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             raw = resp.read().decode("utf-8", errors="replace")
         return json.loads(raw)
 
+    # 국립중앙도서관 공식 가이드(ISBN 서지정보 Open API 활용방법)에 명시된 에러 코드
+    _ERROR_MESSAGES = {
+        "000": "국립중앙도서관 시스템 오류가 발생했습니다.",
+        "010": "인증키 값이 누락되었습니다. 플러그인 설정에서 인증키를 확인해 주세요.",
+        "011": "유효하지 않은 인증키입니다. 발급받은 인증키를 다시 확인해 주세요.",
+        "012": "필수 파라미터가 누락되었습니다.",
+    }
+
     @staticmethod
     def _clean(value):
         if value is None:
@@ -89,31 +97,53 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         return text
 
     @staticmethod
-    def _pick_isbn(doc):
-        # EA_ISBN에는 "9788901234567 03810" 처럼 부가기호가 붙어 오는 경우가 있어
-        # 앞쪽 13자리 ISBN만 추출한다.
-        raw = (doc.get("EA_ISBN") or doc.get("SET_ISBN") or "").strip()
-        if not raw:
-            return ""
-        return raw.split()[0]
+    def _format_date(yyyymmdd):
+        # PUBLISH_PREDATE는 "20220509" 형태(8자리)의 출판예정일로 내려온다.
+        raw = (yyyymmdd or "").strip()
+        if len(raw) == 8 and raw.isdigit():
+            return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+        return raw
+
+    def _extract_error_code(self, data):
+        # 정확한 에러 응답 키가 문서에 명시돼 있지 않아, 알려진 후보 키들을 방어적으로 확인한다.
+        if not isinstance(data, dict):
+            return None
+        for key in ("ERROR_CODE", "ERR_CODE", "errorCode", "error_code", "RESULT_CODE"):
+            code = data.get(key)
+            if code and str(code) in self._ERROR_MESSAGES:
+                return str(code)
+        return None
 
     def _doc_to_item(self, doc):
         title = self._clean(doc.get("TITLE"))
         author = self._clean(doc.get("AUTHOR"))
         publisher = self._clean(doc.get("PUBLISHER"))
-        isbn = self._pick_isbn(doc)
-        pub_date = self._clean(doc.get("REAL_PUBLISH_DATE") or doc.get("PUBLISH_PREDATE"))
+        isbn = self._clean(doc.get("EA_ISBN") or doc.get("SET_ISBN"))
+        pub_date = self._format_date(doc.get("PUBLISH_PREDATE"))
+        cover_url = self._clean(doc.get("TITLE_URL"))
+
         subject = self._clean(doc.get("SUBJECT"))
-        price = self._clean(doc.get("PRE_PRICE"))
+        edition = self._clean(doc.get("EDITION_STMT"))
+        kdc = self._clean(doc.get("KDC"))
         page_info = self._clean(doc.get("PAGE"))
+        book_size = self._clean(doc.get("BOOK_SIZE"))
+        form = self._clean(doc.get("FORM"))
+        price = self._clean(doc.get("PRE_PRICE"))
 
         summary_parts = []
         if subject:
-            summary_parts.append(f"주제분류: {subject}")
-        if page_info:
-            summary_parts.append(f"형태사항: {page_info}")
+            summary_parts.append(f"주제분류(KDC 대분류): {subject}")
+        if kdc:
+            summary_parts.append(f"한국십진분류: {kdc}")
+        if edition:
+            summary_parts.append(f"판사항: {edition}")
+        if form:
+            summary_parts.append(f"형태: {form}")
+        page_size_parts = " / ".join([p for p in [page_info, book_size] if p])
+        if page_size_parts:
+            summary_parts.append(f"페이지/책크기: {page_size_parts}")
         if price:
-            summary_parts.append(f"정가: {price}")
+            summary_parts.append(f"예정가격: {price}")
 
         return {
             "title": title,
@@ -121,6 +151,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "publisher": publisher,
             "isbn": isbn,
             "pub_date": pub_date,
+            "cover_url": cover_url,
             "summary": " / ".join(summary_parts),
             "source": "국립중앙도서관(NLK)",
         }
@@ -144,6 +175,8 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
                          "(무료 발급: https://www.nl.go.kr/seoji/)",
             }
 
+        # 공식 요청 파라미터: cert_key, result_style, page_no, page_size, title(본표제) 등
+        # (title 검색 요청)
         params = {
             "cert_key": cert_key,
             "result_style": "json",
@@ -159,18 +192,25 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             print(f"[NlkBookMetadataProvider] API call failed: {traceback.format_exc()}")
             return {"success": False, "error": "국립중앙도서관 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요."}
 
+        error_code = self._extract_error_code(data)
+        if error_code:
+            message = self._ERROR_MESSAGES.get(error_code, f"알 수 없는 오류(코드 {error_code})가 발생했습니다.")
+            print(f"[NlkBookMetadataProvider] API error code={error_code}")
+            return {"success": False, "error": message}
+
         docs = data.get("docs") or []
+        # title 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
         if not docs:
-            # 제목 검색 결과가 없으면 통합 키워드(kwd)로 한 번 더 시도
             try:
                 params2 = dict(params)
                 params2.pop("title", None)
-                params2["kwd"] = q
+                params2["author"] = q
                 data = self._http_get_json(SEOJI_API_URL, params2)
-                docs = data.get("docs") or []
+                if not self._extract_error_code(data):
+                    docs = data.get("docs") or []
             except Exception:
                 import traceback
-                print(f"[NlkBookMetadataProvider] fallback kwd search failed: {traceback.format_exc()}")
+                print(f"[NlkBookMetadataProvider] fallback author search failed: {traceback.format_exc()}")
 
         items = [self._doc_to_item(doc) for doc in docs if doc.get("TITLE")]
         print(f"[NlkBookMetadataProvider] search returned {len(items)} items")
@@ -191,6 +231,10 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             fields["publisher"] = item_data["publisher"]
         if item_data.get("isbn"):
             fields["isbn"] = item_data["isbn"]
+        if item_data.get("pub_date"):
+            fields["pub_date"] = item_data["pub_date"]
+        if item_data.get("cover_url"):
+            fields["cover_url"] = item_data["cover_url"]
         if item_data.get("summary"):
             fields["summary"] = item_data["summary"]
 
