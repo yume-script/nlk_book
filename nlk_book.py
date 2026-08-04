@@ -155,14 +155,24 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         else:
             description_text = biblio_text
 
+        # 화면(검색결과 카드)의 출간일 줄에는 별도 ISBN 표시 자리가 없고,
+        # pubDate 문자열에 " | ISBN: ..."을 붙여서 함께 보여주는 방식이다.
+        # (unified_book 플러그인과 동일한 표시 관례. apply()에서 저장 시 다시 분리한다.)
+        display_pub_date = f"{pub_date} | ISBN: {isbn}" if isbn else pub_date
+
+        nlk_detail_link = ""
+        if isbn:
+            nlk_detail_link = "https://www.nl.go.kr/seoji/SearchDetail.do?" + urllib.parse.urlencode({"isbn": isbn})
+
         return {
             "title": title,
             "author": author,
             "publisher": publisher,
             "isbn": isbn,
             "isbn13": isbn,
-            "pubDate": pub_date,
+            "pubDate": display_pub_date,
             "cover": cover_url,
+            "link": nlk_detail_link,
             "summary": description_text,
             "description": description_text,
             "source": "국립중앙도서관(NLK)",
@@ -276,7 +286,14 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "pubDate": "pub_date",
             "cover": "cover_url",
             "summary": "summary",
+            "link": "link",
         }
+
+        # 화면 표시용으로 pubDate에 붙여둔 " | ISBN: ..." 접미사를 저장 전에 제거
+        # (unified_book 플러그인의 apply()와 동일한 정제 방식)
+        raw_pub_date = item_data.get("pubDate", "") or ""
+        item_data = dict(item_data)
+        item_data["pubDate"] = raw_pub_date.split(" | ISBN:")[0].strip()
 
         gateway = self.get_db_gateway(db_type)
 
