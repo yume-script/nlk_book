@@ -154,6 +154,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "pubDate": pub_date,
             "cover": cover_url,
             "summary": " / ".join(summary_parts),
+            "description": " / ".join(summary_parts),
             "source": "국립중앙도서관(NLK)",
         }
 
@@ -168,6 +169,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "author": "",
             "publisher": "",
             "summary": summary,
+            "description": summary,
             "isbn": "",
             "cover": "",
             "pubDate": "",
