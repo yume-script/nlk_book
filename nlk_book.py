@@ -151,10 +151,27 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "author": author,
             "publisher": publisher,
             "isbn": isbn,
-            "pub_date": pub_date,
-            "cover_url": cover_url,
+            "pubDate": pub_date,
+            "cover": cover_url,
             "summary": " / ".join(summary_parts),
             "source": "국립중앙도서관(NLK)",
+        }
+
+    @staticmethod
+    def _fail_item(title, summary):
+        """검색 실패/오류 상황을 결과 카드 한 장으로 표현.
+        _not_applicable 플래그로 apply() 단계에서 실수로 저장되지 않도록 막는다.
+        (extract_isbn 플러그인과 동일한 패턴)
+        """
+        return {
+            "title": title,
+            "author": "",
+            "publisher": "",
+            "summary": summary,
+            "isbn": "",
+            "cover": "",
+            "pubDate": "",
+            "_not_applicable": True,
         }
 
     # ------------------------------------------------------------------
@@ -169,16 +186,14 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         print(f"[NlkBookMetadataProvider] search called db_type={db_type!r} query={q!r}")
 
         if not q:
-            return {"success": True, "items": []}
+            return []
 
         cert_key = self._get_cert_key(db_type)
         if not cert_key:
-            return {
-                "success": False,
-                "error": "국립중앙도서관 Seoji 인증키가 설정되지 않았습니다. "
-                         "환경설정 > 플러그인 설정에서 인증키를 입력해 주세요. "
-                         "(무료 발급: https://www.nl.go.kr/seoji/)",
-            }
+            return [self._fail_item(
+                "❌ 인증키가 설정되지 않았습니다",
+                "환경설정 > 플러그인 설정에서 Seoji 인증키를 입력해 주세요. (무료 발급: https://www.nl.go.kr/seoji/)",
+            )]
 
         # 공식 요청 파라미터: cert_key, result_style, page_no, page_size, title(본표제)
         params = {
@@ -194,13 +209,13 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         except Exception:
             import traceback
             print(f"[NlkBookMetadataProvider] API call failed: {traceback.format_exc()}")
-            return {"success": False, "error": "국립중앙도서관 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요."}
+            return [self._fail_item("❌ API 호출 실패", "국립중앙도서관 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")]
 
         error_code = self._extract_error_code(data)
         if error_code:
             message = self._ERROR_MESSAGES.get(error_code, f"알 수 없는 오류(코드 {error_code})가 발생했습니다.")
             print(f"[NlkBookMetadataProvider] API error code={error_code}")
-            return {"success": False, "error": message}
+            return [self._fail_item("❌ 국립중앙도서관 API 오류", message)]
 
         docs = data.get("docs") or []
         # 제목 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
@@ -218,7 +233,11 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
 
         items = [self._doc_to_item(doc) for doc in docs if doc.get("TITLE")]
         print(f"[NlkBookMetadataProvider] search returned {len(items)} items")
-        return {"success": True, "items": items}
+
+        if not items:
+            return [self._fail_item("❌ 검색 결과 없음", f'"{q}"와 일치하는 도서를 국립중앙도서관에서 찾지 못했습니다.')]
+
+        return items
 
     def apply(self, db_type, book_id, item_data):
         print(f"[NlkBookMetadataProvider] apply called db_type={db_type!r} book_id={book_id!r}")
@@ -226,27 +245,39 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             return False, "book_id가 없습니다."
 
         item_data = item_data or {}
+        if item_data.get("_not_applicable"):
+            return False, "적용할 수 없는 결과입니다. (검색 실패/안내 카드)"
+
+        # item 필드명(cover/pubDate) -> books 테이블 컬럼명(cover_url/pub_date) 매핑
+        field_to_column = {
+            "title": "title",
+            "author": "author",
+            "publisher": "publisher",
+            "isbn": "isbn",
+            "pubDate": "pub_date",
+            "cover": "cover_url",
+            "summary": "summary",
+        }
+
+        gateway = self.get_db_gateway(db_type)
+
+        # 안전 조치: books 테이블에 실제 존재하는 컬럼만 반영 (extract_isbn 플러그인과 동일한 패턴)
+        try:
+            columns_info = gateway.fetch_all("PRAGMA table_info(books)")
+            existing_columns = {col["name"].lower() for col in columns_info} if columns_info else set()
+        except Exception:
+            existing_columns = set()
+
         fields = {}
-        if item_data.get("title"):
-            fields["title"] = item_data["title"]
-        if item_data.get("author"):
-            fields["author"] = item_data["author"]
-        if item_data.get("publisher"):
-            fields["publisher"] = item_data["publisher"]
-        if item_data.get("isbn"):
-            fields["isbn"] = item_data["isbn"]
-        if item_data.get("pub_date"):
-            fields["pub_date"] = item_data["pub_date"]
-        if item_data.get("cover_url"):
-            fields["cover_url"] = item_data["cover_url"]
-        if item_data.get("summary"):
-            fields["summary"] = item_data["summary"]
+        for item_key, column_name in field_to_column.items():
+            value = item_data.get(item_key)
+            if value and (not existing_columns or column_name.lower() in existing_columns):
+                fields[column_name] = value
 
         if not fields:
-            return False, "적용할 메타데이터가 없습니다."
+            return False, "적용할 메타데이터가 없습니다. (books 테이블에 해당 컬럼이 없을 수 있습니다)"
 
         try:
-            gateway = self.get_db_gateway(db_type)
             set_clause = ", ".join([f"{key} = ?" for key in fields.keys()])
             values = list(fields.values()) + [book_id]
             gateway.execute(f"UPDATE books SET {set_clause} WHERE id = ?", tuple(values))
