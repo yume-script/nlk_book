@@ -5,12 +5,13 @@ BookOasis 메타데이터 검색 플러그인.
 
 - 공식 API: https://www.nl.go.kr/seoji/SearchApi.do
 - 인증키 발급: https://www.nl.go.kr/seoji/ > Open API 신청 (무료)
-- 참고: 인증키가 없으면 search()는 안내 메시지만 반환하고,
-  컨텍스트 메뉴의 "NLK 통합검색에서 열기"는 인증키 없이도 동작합니다.
+- 기본 검색 기준: 책 제목(title). 결과가 없으면 저자명(author)으로 1회 재시도.
+- 인증키가 없으면 search()는 안내 메시지만 반환하고,
+  컨텍스트 메뉴의 "국립중앙도서관 통합검색에서 열기"는 인증키 없이도 동작합니다.
 """
+import json
 import urllib.parse
 import urllib.request
-import json
 
 from plugins.metadata.base import BaseMetadataProvider
 
@@ -92,7 +93,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         if value is None:
             return ""
         text = str(value).strip()
-        # Seoji 응답의 <> 강조 태그(검색어 하이라이트) 제거
+        # Seoji 응답의 강조 태그(검색어 하이라이트) 제거
         text = text.replace("<span>", "").replace("</span>", "")
         return text
 
@@ -105,7 +106,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         return raw
 
     def _extract_error_code(self, data):
-        # 정확한 에러 응답 키가 문서에 명시돼 있지 않아, 알려진 후보 키들을 방어적으로 확인한다.
+        # 정확한 에러 응답 키가 공식 문서에 명시돼 있지 않아, 알려진 후보 키들을 방어적으로 확인한다.
         if not isinstance(data, dict):
             return None
         for key in ("ERROR_CODE", "ERR_CODE", "errorCode", "error_code", "RESULT_CODE"):
@@ -160,6 +161,10 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
     # 필수 계약: search / apply
     # ------------------------------------------------------------------
     def search(self, db_type, query):
+        """
+        기본 검색 기준은 '책 제목(title)'이다.
+        title 검색 결과가 없으면 author 파라미터로 1회 재시도한다.
+        """
         q = str(query or "").strip()
         print(f"[NlkBookMetadataProvider] search called db_type={db_type!r} query={q!r}")
 
@@ -175,14 +180,13 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
                          "(무료 발급: https://www.nl.go.kr/seoji/)",
             }
 
-        # 공식 요청 파라미터: cert_key, result_style, page_no, page_size, title(본표제) 등
-        # (title 검색 요청)
+        # 공식 요청 파라미터: cert_key, result_style, page_no, page_size, title(본표제)
         params = {
             "cert_key": cert_key,
             "result_style": "json",
             "page_no": 1,
             "page_size": self._get_page_size(db_type),
-            "title": q,
+            "title": q,  # 기본 검색 값 = 책 이름
         }
 
         try:
@@ -199,7 +203,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             return {"success": False, "error": message}
 
         docs = data.get("docs") or []
-        # title 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
+        # 제목 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
         if not docs:
             try:
                 params2 = dict(params)
