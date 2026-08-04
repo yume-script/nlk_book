@@ -213,6 +213,8 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             print(f"[NlkBookMetadataProvider] API call failed: {traceback.format_exc()}")
             return [self._fail_item("❌ API 호출 실패", "국립중앙도서관 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")]
 
+        print(f"[NlkBookMetadataProvider] RAW response (title search): {json.dumps(data, ensure_ascii=False)}")
+
         error_code = self._extract_error_code(data)
         if error_code:
             message = self._ERROR_MESSAGES.get(error_code, f"알 수 없는 오류(코드 {error_code})가 발생했습니다.")
@@ -227,11 +229,16 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
                 params2.pop("title", None)
                 params2["author"] = q
                 data = self._http_get_json(SEOJI_API_URL, params2)
+                print(f"[NlkBookMetadataProvider] RAW response (author fallback): {json.dumps(data, ensure_ascii=False)}")
                 if not self._extract_error_code(data):
                     docs = data.get("docs") or []
             except Exception:
                 import traceback
                 print(f"[NlkBookMetadataProvider] fallback author search failed: {traceback.format_exc()}")
+
+        print(f"[NlkBookMetadataProvider] docs count={len(docs)}")
+        for idx, doc in enumerate(docs):
+            print(f"[NlkBookMetadataProvider] doc[{idx}] = {json.dumps(doc, ensure_ascii=False)}")
 
         items = [self._doc_to_item(doc) for doc in docs if doc.get("TITLE")]
         print(f"[NlkBookMetadataProvider] search returned {len(items)} items")
