@@ -261,7 +261,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         params = dict(base_params)
         params.update(extra)
         data = self._http_get_json(SEOJI_API_URL, params)
-        print(f"[NlkBookMetadataProvider] RAW response ({list(extra.keys())}): {json.dumps(data, ensure_ascii=False)}")
+        #print(f"[NlkBookMetadataProvider] RAW response ({list(extra.keys())}): {json.dumps(data, ensure_ascii=False)}")
         if self._extract_error_code(data):
             return data, self._extract_error_code(data)
         return data, None
@@ -277,7 +277,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
           title 검색 결과가 없으면 author 파라미터로 1회 재시도한다.
         """
         q = str(query or "").strip()
-        print(f"[NlkBookMetadataProvider] search called db_type={db_type!r} query={q!r}")
+        #print(f"[NlkBookMetadataProvider] search called db_type={db_type!r} query={q!r}")
 
         if not q:
             return []
