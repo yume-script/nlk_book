@@ -5,13 +5,25 @@ BookOasis 메타데이터 검색 플러그인.
 
 - 공식 API: https://www.nl.go.kr/seoji/SearchApi.do
 - 인증키 발급: https://www.nl.go.kr/seoji/ > Open API 신청 (무료)
-- 기본 검색 기준: 책 제목(title). 결과가 없으면 저자명(author)으로 1회 재시도.
+- 기본 검색 기준: 책 제목(title). 입력값이 유효한 ISBN(10/13자리)이면 isbn 파라미터로
+  우선 검색하고, 그 외에는 title로 검색한다. title 결과가 없으면 author로 1회 재시도한다.
 - 인증키가 없으면 search()는 안내 메시지만 반환하고,
-  컨텍스트 메뉴의 "국립중앙도서관 통합검색에서 열기"는 인증키 없이도 동작합니다.
+  컨텍스트 메뉴의 "국립중앙도서관 통합검색에서 열기"는 인증키 없이도 동작한다.
+- apply()는 unified_book 플러그인과 동일한 books 테이블 스키마(title/author/publisher/
+  summary/link/release_date/isbn/cover_image/cover_updated_at)를 기준으로 저장한다.
 """
+import hashlib
+import io
 import json
+import os
+import re
 import urllib.parse
 import urllib.request
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from plugins.metadata.base import BaseMetadataProvider
 
@@ -80,6 +92,13 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             raw = resp.read().decode("utf-8", errors="replace")
         return json.loads(raw)
 
+    @staticmethod
+    def _get_row_val(row, key, default=None):
+        try:
+            return row[key]
+        except Exception:
+            return getattr(row, key, default)
+
     # 국립중앙도서관 공식 가이드(ISBN 서지정보 Open API 활용방법)에 명시된 에러 코드
     _ERROR_MESSAGES = {
         "000": "국립중앙도서관 시스템 오류가 발생했습니다.",
@@ -113,6 +132,47 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             code = data.get(key)
             if code and str(code) in self._ERROR_MESSAGES:
                 return str(code)
+        return None
+
+    # ------------------------------------------------------------------
+    # ISBN 검증/변환 (unified_book 플러그인의 validate_isbn13/validate_isbn10 방식 참고)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_isbn13(isbn):
+        if len(isbn) != 13 or not isbn.isdigit():
+            return False
+        total = sum((int(d) * (1 if i % 2 == 0 else 3)) for i, d in enumerate(isbn))
+        return total % 10 == 0
+
+    @staticmethod
+    def _validate_isbn10(isbn):
+        if len(isbn) != 10:
+            return False
+        total = 0
+        for i, ch in enumerate(isbn):
+            if ch == "X" and i == 9:
+                val = 10
+            elif ch.isdigit():
+                val = int(ch)
+            else:
+                return False
+            total += (10 - i) * val
+        return total % 11 == 0
+
+    @staticmethod
+    def _isbn10_to_isbn13(isbn10):
+        core = "978" + isbn10[:9]
+        total = sum((int(d) * (1 if i % 2 == 0 else 3)) for i, d in enumerate(core))
+        check = (10 - (total % 10)) % 10
+        return core + str(check)
+
+    def _detect_isbn(self, query):
+        """입력값이 유효한 ISBN(10 또는 13자리)이면 정규화된 13자리 ISBN을 반환, 아니면 None."""
+        candidate = re.sub(r"[^0-9Xx]", "", query or "").upper()
+        if self._validate_isbn13(candidate):
+            return candidate
+        if self._validate_isbn10(candidate):
+            return self._isbn10_to_isbn13(candidate)
         return None
 
     def _doc_to_item(self, doc):
@@ -193,16 +253,28 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
             "isbn": "",
             "cover": "",
             "pubDate": "",
+            "link": "",
             "_not_applicable": True,
         }
+
+    def _call_seoji(self, base_params, extra):
+        params = dict(base_params)
+        params.update(extra)
+        data = self._http_get_json(SEOJI_API_URL, params)
+        print(f"[NlkBookMetadataProvider] RAW response ({list(extra.keys())}): {json.dumps(data, ensure_ascii=False)}")
+        if self._extract_error_code(data):
+            return data, self._extract_error_code(data)
+        return data, None
 
     # ------------------------------------------------------------------
     # 필수 계약: search / apply
     # ------------------------------------------------------------------
     def search(self, db_type, query):
         """
-        기본 검색 기준은 '책 제목(title)'이다.
-        title 검색 결과가 없으면 author 파라미터로 1회 재시도한다.
+        - 입력값이 유효한 ISBN(10/13자리, 체크섬 검증)이면 isbn 파라미터로 우선 검색한다.
+          (필요 시 set_isbn 파라미터로 한 번 더 재시도)
+        - ISBN이 아니면 기본 검색 기준은 '책 제목(title)'이다.
+          title 검색 결과가 없으면 author 파라미터로 1회 재시도한다.
         """
         q = str(query or "").strip()
         print(f"[NlkBookMetadataProvider] search called db_type={db_type!r} query={q!r}")
@@ -217,44 +289,53 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
                 "환경설정 > 플러그인 설정에서 Seoji 인증키를 입력해 주세요. (무료 발급: https://www.nl.go.kr/seoji/)",
             )]
 
-        # 공식 요청 파라미터: cert_key, result_style, page_no, page_size, title(본표제)
-        params = {
+        base_params = {
             "cert_key": cert_key,
             "result_style": "json",
             "page_no": 1,
             "page_size": self._get_page_size(db_type),
-            "title": q,  # 기본 검색 값 = 책 이름
         }
 
+        isbn_query = self._detect_isbn(q)
+        docs = []
+
         try:
-            data = self._http_get_json(SEOJI_API_URL, params)
+            if isbn_query:
+                # 1) 유효한 ISBN 입력 -> isbn 파라미터로 우선 검색
+                data, err = self._call_seoji(base_params, {"isbn": isbn_query})
+                if err:
+                    message = self._ERROR_MESSAGES.get(err, f"알 수 없는 오류(코드 {err})가 발생했습니다.")
+                    return [self._fail_item("❌ 국립중앙도서관 API 오류", message)]
+                docs = data.get("docs") or []
+
+                # 세트 ISBN일 가능성 -> set_isbn으로 재시도
+                if not docs:
+                    data, err = self._call_seoji(base_params, {"set_isbn": isbn_query})
+                    if not err:
+                        docs = data.get("docs") or []
+
+                if not docs:
+                    return [self._fail_item(
+                        "❌ 검색 결과 없음",
+                        f'ISBN "{isbn_query}"에 해당하는 도서를 국립중앙도서관에서 찾지 못했습니다.',
+                    )]
+            else:
+                # 2) 기본 검색 값 = 책 이름(title)
+                data, err = self._call_seoji(base_params, {"title": q})
+                if err:
+                    message = self._ERROR_MESSAGES.get(err, f"알 수 없는 오류(코드 {err})가 발생했습니다.")
+                    return [self._fail_item("❌ 국립중앙도서관 API 오류", message)]
+                docs = data.get("docs") or []
+
+                # 제목 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
+                if not docs:
+                    data, err = self._call_seoji(base_params, {"author": q})
+                    if not err:
+                        docs = data.get("docs") or []
         except Exception:
             import traceback
             print(f"[NlkBookMetadataProvider] API call failed: {traceback.format_exc()}")
             return [self._fail_item("❌ API 호출 실패", "국립중앙도서관 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")]
-
-        print(f"[NlkBookMetadataProvider] RAW response (title search): {json.dumps(data, ensure_ascii=False)}")
-
-        error_code = self._extract_error_code(data)
-        if error_code:
-            message = self._ERROR_MESSAGES.get(error_code, f"알 수 없는 오류(코드 {error_code})가 발생했습니다.")
-            print(f"[NlkBookMetadataProvider] API error code={error_code}")
-            return [self._fail_item("❌ 국립중앙도서관 API 오류", message)]
-
-        docs = data.get("docs") or []
-        # 제목 검색 결과가 없을 경우, 저자명일 가능성을 고려해 author 파라미터로 한 번 더 시도
-        if not docs:
-            try:
-                params2 = dict(params)
-                params2.pop("title", None)
-                params2["author"] = q
-                data = self._http_get_json(SEOJI_API_URL, params2)
-                print(f"[NlkBookMetadataProvider] RAW response (author fallback): {json.dumps(data, ensure_ascii=False)}")
-                if not self._extract_error_code(data):
-                    docs = data.get("docs") or []
-            except Exception:
-                import traceback
-                print(f"[NlkBookMetadataProvider] fallback author search failed: {traceback.format_exc()}")
 
         print(f"[NlkBookMetadataProvider] docs count={len(docs)}")
         for idx, doc in enumerate(docs):
@@ -269,6 +350,9 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         return items
 
     def apply(self, db_type, book_id, item_data):
+        """unified_book 플러그인과 동일한 books 테이블 스키마 기준으로 저장한다.
+        (title, author, publisher, summary, link, release_date, isbn[선택], cover_image, cover_updated_at)
+        """
         print(f"[NlkBookMetadataProvider] apply called db_type={db_type!r} book_id={book_id!r}")
         if not book_id:
             return False, "book_id가 없습니다."
@@ -277,52 +361,81 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         if item_data.get("_not_applicable"):
             return False, "적용할 수 없는 결과입니다. (검색 실패/안내 카드)"
 
-        # item 필드명(cover/pubDate) -> books 테이블 컬럼명(cover_url/pub_date) 매핑
-        field_to_column = {
-            "title": "title",
-            "author": "author",
-            "publisher": "publisher",
-            "isbn": "isbn",
-            "pubDate": "pub_date",
-            "cover": "cover_url",
-            "summary": "summary",
-            "link": "link",
-        }
-
-        # 화면 표시용으로 pubDate에 붙여둔 " | ISBN: ..." 접미사를 저장 전에 제거
-        # (unified_book 플러그인의 apply()와 동일한 정제 방식)
-        raw_pub_date = item_data.get("pubDate", "") or ""
-        item_data = dict(item_data)
-        item_data["pubDate"] = raw_pub_date.split(" | ISBN:")[0].strip()
-
         gateway = self.get_db_gateway(db_type)
-
-        # 안전 조치: books 테이블에 실제 존재하는 컬럼만 반영 (extract_isbn 플러그인과 동일한 패턴)
         try:
+            book = gateway.fetch_one("SELECT file_path, library_id FROM books WHERE id = ?", (book_id,))
+            if not book:
+                return False, "도서를 찾을 수 없습니다."
+
+            file_path = self._get_row_val(book, "file_path")
+            library_id = self._get_row_val(book, "library_id")
+
+            # 표지: URL을 그대로 저장하지 않고 다운로드 -> WebP 변환 -> covers/<library_id>/ 에 저장
+            cover_url = item_data.get("cover")
+            cover_filename = None
+            if cover_url and Image is not None:
+                try:
+                    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                    covers_dir = os.path.join(base_dir, "covers", str(library_id))
+                    os.makedirs(covers_dir, exist_ok=True)
+                    hash_source = os.path.basename(file_path) if file_path else str(book_id)
+                    book_hash = hashlib.md5(hash_source.encode("utf-8")).hexdigest()
+                    filename_only = f"book_{book_hash}.webp"
+                    dest_path = os.path.join(covers_dir, filename_only)
+
+                    req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=15) as response:
+                        with Image.open(io.BytesIO(response.read())) as img:
+                            img.save(dest_path, "WEBP", quality=95)
+                    cover_filename = f"{library_id}/{filename_only}"
+                except Exception:
+                    import traceback
+                    print(f"[NlkBookMetadataProvider] cover save failed: {traceback.format_exc()}")
+                    cover_filename = None
+            elif cover_url and Image is None:
+                print("[NlkBookMetadataProvider] Pillow(PIL)가 없어 표지 이미지 저장을 건너뜁니다.")
+
+            # 화면 표시용으로 pubDate에 붙여둔 " | ISBN: ..." 접미사 제거 후 순수 날짜만 저장
+            pub_date_raw = item_data.get("pubDate", "") or ""
+            clean_pub_date = pub_date_raw.split(" | ISBN:")[0].replace(" *", "").strip()
+
+            # ISBN 표준화 (특수문자/하이픈 제거, X 대문자 정렬)
+            raw_isbn = item_data.get("isbn", "") or ""
+            clean_isbn = re.sub(r"[^0-9X]", "", str(raw_isbn).upper())
+
+            # HTML 태그 제거
+            raw_summary = item_data.get("description") or item_data.get("summary") or ""
+            final_summary = re.sub("<[^<]+?>", "", raw_summary)
+
+            # 안전 조치: books 테이블에 'isbn' 컬럼이 실제 존재하는지 동적 확인
             columns_info = gateway.fetch_all("PRAGMA table_info(books)")
-            existing_columns = {col["name"].lower() for col in columns_info} if columns_info else set()
-        except Exception:
-            existing_columns = set()
+            columns = [col["name"].lower() for col in columns_info] if columns_info else []
+            has_isbn_column = "isbn" in columns
 
-        fields = {}
-        for item_key, column_name in field_to_column.items():
-            value = item_data.get(item_key)
-            if value and (not existing_columns or column_name.lower() in existing_columns):
-                fields[column_name] = value
+            if has_isbn_column:
+                gateway.execute(
+                    """UPDATE books SET title = ?, author = ?, publisher = ?, summary = ?, link = ?,
+                       release_date = ?, isbn = COALESCE(NULLIF(?, ''), isbn), cover_image = COALESCE(NULLIF(?, ''), cover_image),
+                       cover_updated_at = CASE WHEN ? IS NOT NULL AND ? != '' THEN CURRENT_TIMESTAMP ELSE cover_updated_at END
+                       WHERE id = ?""",
+                    (item_data.get("title"), item_data.get("author"), item_data.get("publisher"), final_summary,
+                     item_data.get("link"), clean_pub_date, clean_isbn, cover_filename, cover_filename, cover_filename, book_id),
+                )
+            else:
+                gateway.execute(
+                    """UPDATE books SET title = ?, author = ?, publisher = ?, summary = ?, link = ?,
+                       release_date = ?, cover_image = COALESCE(NULLIF(?, ''), cover_image),
+                       cover_updated_at = CASE WHEN ? IS NOT NULL AND ? != '' THEN CURRENT_TIMESTAMP ELSE cover_updated_at END
+                       WHERE id = ?""",
+                    (item_data.get("title"), item_data.get("author"), item_data.get("publisher"), final_summary,
+                     item_data.get("link"), clean_pub_date, cover_filename, cover_filename, cover_filename, book_id),
+                )
 
-        if not fields:
-            return False, "적용할 메타데이터가 없습니다. (books 테이블에 해당 컬럼이 없을 수 있습니다)"
-
-        try:
-            set_clause = ", ".join([f"{key} = ?" for key in fields.keys()])
-            values = list(fields.values()) + [book_id]
-            gateway.execute(f"UPDATE books SET {set_clause} WHERE id = ?", tuple(values))
-        except Exception:
+            return True, f"[{item_data.get('source')}] 정보가 성공적으로 적용되었습니다."
+        except Exception as e:
             import traceback
             print(f"[NlkBookMetadataProvider] apply failed: {traceback.format_exc()}")
-            return False, "메타데이터 적용 중 오류가 발생했습니다."
-
-        return True, "국립중앙도서관 메타데이터가 적용되었습니다."
+            return False, f"적용 오류: {str(e)}"
 
     # ------------------------------------------------------------------
     # 선택 계약: 컨텍스트 메뉴 (인증키 없이도 동작)
