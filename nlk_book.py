@@ -122,6 +122,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         isbn = self._clean(doc.get("EA_ISBN") or doc.get("SET_ISBN"))
         pub_date = self._format_date(doc.get("PUBLISH_PREDATE"))
         cover_url = self._clean(doc.get("TITLE_URL"))
+        intro = self._clean(doc.get("BOOK_INTRODUCTION"))
 
         subject = self._clean(doc.get("SUBJECT"))
         edition = self._clean(doc.get("EDITION_STMT"))
@@ -131,30 +132,39 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
         form = self._clean(doc.get("FORM"))
         price = self._clean(doc.get("PRE_PRICE"))
 
-        summary_parts = []
+        biblio_parts = []
         if subject:
-            summary_parts.append(f"주제분류(KDC 대분류): {subject}")
+            biblio_parts.append(f"주제분류(KDC 대분류): {subject}")
         if kdc:
-            summary_parts.append(f"한국십진분류: {kdc}")
+            biblio_parts.append(f"한국십진분류: {kdc}")
         if edition:
-            summary_parts.append(f"판사항: {edition}")
+            biblio_parts.append(f"판사항: {edition}")
         if form:
-            summary_parts.append(f"형태: {form}")
+            biblio_parts.append(f"형태: {form}")
         page_size_parts = " / ".join([p for p in [page_info, book_size] if p])
         if page_size_parts:
-            summary_parts.append(f"페이지/책크기: {page_size_parts}")
+            biblio_parts.append(f"페이지/책크기: {page_size_parts}")
         if price:
-            summary_parts.append(f"예정가격: {price}")
+            biblio_parts.append(f"예정가격: {price}")
+
+        biblio_text = " / ".join(biblio_parts)
+        # 실제 책소개(BOOK_INTRODUCTION)가 있으면 맨 앞에 우선 배치하고,
+        # 서지정보(KDC/형태/가격 등)는 뒤에 덧붙인다. 소개글이 없으면 서지정보만 사용.
+        if intro:
+            description_text = intro if not biblio_text else f"{intro}\n\n[서지정보] {biblio_text}"
+        else:
+            description_text = biblio_text
 
         return {
             "title": title,
             "author": author,
             "publisher": publisher,
             "isbn": isbn,
+            "isbn13": isbn,
             "pubDate": pub_date,
             "cover": cover_url,
-            "summary": " / ".join(summary_parts),
-            "description": " / ".join(summary_parts),
+            "summary": description_text,
+            "description": description_text,
             "source": "국립중앙도서관(NLK)",
         }
 
