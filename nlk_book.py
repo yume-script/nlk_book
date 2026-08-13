@@ -162,7 +162,7 @@ class NlkBookMetadataProvider(BaseMetadataProvider):
     """BookOasis 국립중앙도서관(Seoji) 도서검색 플러그인"""
 
     id = "nlk_book"
-    name = "국립중앙도서관 도서검색"
+    name = "국립중앙도서관(NLK) 도서검색"
     is_searchable = True
 
     config_schema = [
